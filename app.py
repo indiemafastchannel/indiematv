@@ -4,7 +4,6 @@ import requests
 import m3u8
 import math
 from threading import Lock
-from urllib.parse import urljoin
 
 app = Flask(__name__)
 
@@ -17,23 +16,21 @@ state = {
     'message': None
 }
 
-# --- Helpers ---
 def parse_m3u8(url):
     resp = requests.get(url)
     master = m3u8.loads(resp.text)
     variants = {}
     for playlist in master.playlists:
-        variant_url = urljoin(url, playlist.uri)
+        variant_url = requests.compat.urljoin(url, playlist.uri)
         media = m3u8.load(variant_url)
-        segments = [(urljoin(variant_url, seg.uri), seg.duration, False) for seg in media.segments]
-        max_dur = max((seg.duration for seg in media.segments), default=10.0)
+        segments = [(requests.compat.urljoin(variant_url, seg.uri), seg.duration, False) for seg in media.segments]
+        max_dur = max(seg.duration for seg in media.segments) if media.segments else 10.0
         variants[playlist.stream_info.bandwidth] = {
             'segments': segments,
             'target_dur': math.ceil(max_dur)
         }
     return master, variants
 
-# --- Routes ---
 @app.route('/', methods=['GET', 'POST'])
 def index():
     with state['lock']:
@@ -42,7 +39,8 @@ def index():
         state['message'] = None
 
     if request.method == 'POST':
-        urls = [url for url in request.form.getlist('urls') if url]
+        urls = request.form.getlist('urls')
+        urls = [url for url in urls if url]
         with state['lock']:
             if 'start' in request.form:
                 if state['start_time'] is not None:
@@ -58,7 +56,6 @@ def index():
                                 bws = set(variants.keys())
                             elif bws != set(variants.keys()):
                                 raise ValueError("Inconsistent variants across files")
-                            # Mark first segment discontinuity for stitched files
                             if i > 0:
                                 for data in variants.values():
                                     if data['segments']:
@@ -81,33 +78,36 @@ def index():
         return redirect(url_for('index'))
 
     template = '''
-    {% if message %}<p>{{ message }}</p>{% endif %}
-    <form method="post">
-        {% for i in range(10) %}
-            <input type="text" name="urls" placeholder="HLS m3u8 URL {{ i+1 }}"><br>
-        {% endfor %}
-        <button type="submit" name="start">Start Channel</button>
-        <button type="submit" name="stop">Stop Channel</button>
-    </form>
-    {% if running %}
-        <video id="player" width="640" height="360" controls autoplay></video>
-        <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
-        <script>
-            var video = document.getElementById('player');
-            if(Hls.isSupported()) {
-                var hls = new Hls({
-                    liveSyncDuration: 10,
-                    liveMaxLatencyDuration: 20,
-                    lowLatencyMode: false
-                });
-                hls.loadSource('/master.m3u8');
-                hls.attachMedia(video);
-                hls.on(Hls.Events.ERROR, function(event, data){console.error(data);});
-            } else if(video.canPlayType('application/vnd.apple.mpegurl')) {
-                video.src = '/master.m3u8';
-            }
-        </script>
-    {% endif %}
+        {% if message %}<p>{{ message }}</p>{% endif %}
+        <form method="post">
+            {% for i in range(10) %}
+                <input type="text" name="urls" placeholder="HLS m3u8 URL {{ i+1 }}"><br>
+            {% endfor %}
+            <button type="submit" name="start">Start Channel</button>
+            <button type="submit" name="stop">Stop Channel</button>
+        </form>
+        {% if running %}
+            <video id="player" width="640" height="360" controls autoplay></video>
+            <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+            <script>
+                var video = document.getElementById('player');
+                if (Hls.isSupported()) {
+                    var hls = new Hls({
+                        liveSyncDuration: 10,
+                        liveMaxLatencyDuration: 20,
+                        enableWorker: true
+                    });
+                    hls.loadSource('/master.m3u8');
+                    hls.attachMedia(video);
+                    hls.startLoad();
+                    hls.on(Hls.Events.ERROR, function(event, data){
+                        if(data.fatal){ hls.startLoad(); }
+                    });
+                } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+                    video.src = '/master.m3u8';
+                }
+            </script>
+        {% endif %}
     '''
     return render_template_string(template, running=running, message=message)
 
@@ -127,7 +127,8 @@ def master():
         headers = {
             "Cache-Control": "no-cache, no-store, must-revalidate",
             "Pragma": "no-cache",
-            "Expires": "0"
+            "Expires": "0",
+            "Access-Control-Allow-Origin": "*"
         }
         return Response(output, mimetype='application/x-mpegURL', headers=headers)
 
@@ -138,8 +139,6 @@ def variant(bw):
     with state['lock']:
         if state['start_time'] is None:
             return "No channel running.", 404
-
-        # Aggregate all segments across all files
         all_segments = []
         for _, variants in state['files']:
             if bw not in variants:
@@ -148,48 +147,46 @@ def variant(bw):
         if not all_segments:
             return "No segments.", 404
 
-        target_dur = max(math.ceil(s[1]) for s in all_segments)
-        seg_per_cycle = len(all_segments)
-
-        # Calculate current rolling window based on elapsed time
-        elapsed = time.time() - state['start_time']
+        # Total duration of one loop
         total_duration = sum(seg[1] for seg in all_segments)
-        position = elapsed % total_duration
+
+        # Find current position
+        elapsed = time.time() - state['start_time']
+        current_time = elapsed % total_duration
 
         # Determine start index
         offset = 0.0
         start_idx = 0
         for i, (_, dur, _) in enumerate(all_segments):
-            if offset <= position < offset + dur:
+            if offset <= current_time < offset + dur:
                 start_idx = i
                 break
             offset += dur
 
-        media_sequence = int(elapsed / total_duration) * seg_per_cycle + start_idx
-
-        # Build rolling window
+        # Rolling window with wrapping
         window = []
         for i in range(window_size):
             idx = (start_idx + i) % len(all_segments)
             window.append(all_segments[idx])
 
-        # Generate playlist output
-        output = f'#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:{target_dur}\n'
-        output += f'#EXT-X-MEDIA-SEQUENCE:{media_sequence}\n'
-        output += '#EXT-X-PLAYLIST-TYPE:LIVE\n'
+        # Compute media sequence
+        loops = int(elapsed / total_duration)
+        media_sequence = loops * len(all_segments) + start_idx
 
-        for i, (uri, dur, disc) in enumerate(window):
-            if disc:
-                output += '#EXT-X-DISCONTINUITY\n'
+        # Build playlist
+        target_dur = max(math.ceil(s[1]) for s in all_segments)
+        output = f'#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:{target_dur}\n'
+        output += f'#EXT-X-MEDIA-SEQUENCE:{media_sequence}\n#EXT-X-PLAYLIST-TYPE:LIVE\n'
+        for uri, dur, disc in window:
             output += f'#EXTINF:{dur:.6f},\n{uri}\n'
 
         headers = {
             "Cache-Control": "no-cache, no-store, must-revalidate",
             "Pragma": "no-cache",
-            "Expires": "0"
+            "Expires": "0",
+            "Access-Control-Allow-Origin": "*"
         }
         return Response(output, mimetype='application/x-mpegURL', headers=headers)
 
-# --- Run App ---
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, threaded=True)
