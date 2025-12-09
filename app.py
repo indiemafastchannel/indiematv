@@ -17,7 +17,7 @@ state = {
 }
 
 def parse_m3u8(url):
-    resp = requests.get(url)
+    resp = requests.get(url, timeout=10)
     master = m3u8.loads(resp.text)
     variants = {}
     for playlist in master.playlists:
@@ -41,6 +41,7 @@ def index():
     if request.method == 'POST':
         urls = request.form.getlist('urls')
         urls = [url for url in urls if url]
+
         with state['lock']:
             if 'start' in request.form:
                 if state['start_time'] is not None:
@@ -50,31 +51,44 @@ def index():
                         state['files'] = []
                         state['total_duration'] = 0.0
                         bws = None
+
                         for i, url in enumerate(urls):
                             master, variants = parse_m3u8(url)
+
                             if bws is None:
                                 bws = set(variants.keys())
                             elif bws != set(variants.keys()):
                                 raise ValueError("Inconsistent variants across files")
+
                             if i > 0:
                                 for data in variants.values():
                                     if data['segments']:
                                         uri, dur, _ = data['segments'][0]
                                         data['segments'][0] = (uri, dur, True)
+
                             state['files'].append((master, variants))
-                            file_dur = sum(seg[1] for seg in next(iter(variants.values()))['segments']) if variants else 0.0
+
+                            file_dur = sum(
+                                seg[1] for seg in next(iter(variants.values()))['segments']
+                            ) if variants else 0.0
+
                             state['total_duration'] += file_dur
+
                         if state['total_duration'] == 0.0:
                             raise ValueError("No valid segments found")
+
                         state['start_time'] = time.time()
                         state['message'] = "Channel started. Master URL: /master.m3u8"
+
                     except Exception as e:
                         state['message'] = f"Error: {str(e)}"
+
             elif 'stop' in request.form:
                 state['start_time'] = None
                 state['files'] = []
                 state['total_duration'] = 0.0
                 state['message'] = "Channel stopped."
+
         return redirect(url_for('index'))
 
     template = '''
@@ -86,6 +100,7 @@ def index():
             <button type="submit" name="start">Start Channel</button>
             <button type="submit" name="stop">Stop Channel</button>
         </form>
+
         {% if running %}
             <video id="player" width="640" height="360" controls autoplay></video>
             <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
@@ -101,7 +116,7 @@ def index():
                     hls.attachMedia(video);
                     hls.startLoad();
                     hls.on(Hls.Events.ERROR, function(event, data){
-                        if(data.fatal){ hls.startLoad(); }
+                        if(data.fatal) { hls.startLoad(); }
                     });
                 } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
                     video.src = '/master.m3u8';
@@ -116,45 +131,48 @@ def master():
     with state['lock']:
         if not state['files']:
             return "No channel running.", 404
+
         master = state['files'][0][0]
         output = '#EXTM3U\n#EXT-X-VERSION:3\n'
+
         for pl in master.playlists:
             output += f'#EXT-X-STREAM-INF:BANDWIDTH={pl.stream_info.bandwidth}'
             if pl.stream_info.resolution:
                 output += f',RESOLUTION={pl.stream_info.resolution}'
             output += '\n'
             output += f'variant_{pl.stream_info.bandwidth}.m3u8\n'
+
         headers = {
             "Cache-Control": "no-cache, no-store, must-revalidate",
             "Pragma": "no-cache",
             "Expires": "0",
             "Access-Control-Allow-Origin": "*"
         }
+
         return Response(output, mimetype='application/x-mpegURL', headers=headers)
 
 @app.route('/variant_<bw>.m3u8')
 def variant(bw):
     bw = int(bw)
     window_size = 6
+
     with state['lock']:
         if state['start_time'] is None:
             return "No channel running.", 404
+
         all_segments = []
         for _, variants in state['files']:
             if bw not in variants:
                 return "Variant not found.", 404
             all_segments.extend(variants[bw]['segments'])
+
         if not all_segments:
             return "No segments.", 404
 
-        # Total duration of one loop
         total_duration = sum(seg[1] for seg in all_segments)
-
-        # Find current position
         elapsed = time.time() - state['start_time']
         current_time = elapsed % total_duration
 
-        # Determine start index
         offset = 0.0
         start_idx = 0
         for i, (_, dur, _) in enumerate(all_segments):
@@ -163,20 +181,24 @@ def variant(bw):
                 break
             offset += dur
 
-        # Rolling window with wrapping
         window = []
         for i in range(window_size):
             idx = (start_idx + i) % len(all_segments)
             window.append(all_segments[idx])
 
-        # Compute media sequence
         loops = int(elapsed / total_duration)
         media_sequence = loops * len(all_segments) + start_idx
 
-        # Build playlist
+        # ✅ Correct LIVE TV playlist format
         target_dur = max(math.ceil(s[1]) for s in all_segments)
-        output = f'#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:{target_dur}\n'
-        output += f'#EXT-X-MEDIA-SEQUENCE:{media_sequence}\n#EXT-X-PLAYLIST-TYPE:LIVE\n'
+
+        output = '#EXTM3U\n'
+        output += '#EXT-X-VERSION:3\n'
+        output += '#EXT-X-INDEPENDENT-SEGMENTS\n'
+        output += f'#EXT-X-TARGETDURATION:{target_dur}\n'
+        output += f'#EXT-X-MEDIA-SEQUENCE:{media_sequence}\n'
+        output += '#EXT-X-DISCONTINUITY-SEQUENCE:0\n'
+
         for uri, dur, disc in window:
             output += f'#EXTINF:{dur:.6f},\n{uri}\n'
 
@@ -186,6 +208,7 @@ def variant(bw):
             "Expires": "0",
             "Access-Control-Allow-Origin": "*"
         }
+
         return Response(output, mimetype='application/x-mpegURL', headers=headers)
 
 if __name__ == '__main__':
